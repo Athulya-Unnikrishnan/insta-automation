@@ -135,6 +135,40 @@ def ping_playwright():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route("/debug-screenshots")
+def debug_screenshots():
+    """
+    List all debug screenshots taken during login attempts.
+    Visit /debug-screenshots to see what Instagram showed the headless browser.
+    """
+    if not SCRAPER_OK:
+        return jsonify({"error": "Scraper not initialized"}), 500
+    from scraper import DEBUG_DIR
+    from flask import send_file
+    name = request.args.get("name")
+    if name:
+        # Serve a specific screenshot
+        img_path = DEBUG_DIR / name
+        if img_path.exists() and img_path.suffix == ".png":
+            return send_file(str(img_path), mimetype="image/png")
+        return "Screenshot not found", 404
+
+    # List all screenshots
+    files = sorted(DEBUG_DIR.glob("*.png"), key=lambda f: f.stat().st_mtime, reverse=True)
+    links = [
+        f'<li><a href="/debug-screenshots?name={f.name}" target="_blank">{f.name}</a></li>'
+        for f in files[:20]
+    ]
+    html = (
+        "<html><body style='font-family:monospace;background:#111;color:#eee;padding:20px'>"
+        f"<h2>Debug Screenshots ({len(files)} total)</h2>"
+        "<p>These are screenshots taken by Playwright during login attempts.</p>"
+        f"<ul>{''.join(links) if links else '<li>No screenshots yet — try logging in first.</li>'}</ul>"
+        "</body></html>"
+    )
+    return html
+
+
 @app.route("/")
 @require_auth
 def index():

@@ -60,10 +60,20 @@ LOAD_MORE_SELECTORS = [
 ]
 
 DISMISS_SELECTORS = [
+    # Cookie consent (various Instagram variants)
     "button:has-text('Allow all cookies')",
     "button:has-text('Accept All')",
+    "button:has-text('Accept all')",
+    "button:has-text('Allow essential and optional cookies')",
+    "button:has-text('Allow')",
+    # Notification prompts
     "button:has-text('Not Now')",
+    "button:has-text('Not now')",
+    # Generic close / dismiss
     "[aria-label='Close']",
+    "button:has-text('Close')",
+    # "Use the app" interstitial sometimes shown before login
+    "button:has-text('Continue')",
 ]
 
 
@@ -164,19 +174,71 @@ def login(username: str, password: str) -> dict:
         page = context.new_page()
 
         try:
+            logger.info("Navigating to Instagram login page for %s", username)
             page.goto(
                 "https://www.instagram.com/accounts/login/",
-                wait_until="domcontentloaded",
-                timeout=30_000,
+                wait_until="networkidle",   # wait for all requests to settle
+                timeout=45_000,
             )
-            time.sleep(2)
 
-            # Dismiss cookie banner if present
-            _dismiss_dialogs(page)
+            # Take a screenshot IMMEDIATELY so we can see what Instagram showed
+            _save_debug_screenshot(page, f"login_page_{username[:6]}")
+            logger.info("Login page loaded. URL: %s", page.url)
 
-            # Fill username field
-            user_input = page.locator("input[name='username']")
-            user_input.wait_for(timeout=10_000)
+            # Give the page a moment to render any overlays
+            time.sleep(3)
+
+            # ── Dismiss ANY pre-login dialogs (cookie walls, interstitials) ─
+            # Try each selector and dismiss up to 3 rounds of dialogs
+            for _round in range(3):
+                dismissed_any = False
+                for sel in DISMISS_SELECTORS:
+                    try:
+                        btn = page.locator(sel).first
+                        if btn.is_visible(timeout=1_500):
+                            btn.click()
+                            dismissed_any = True
+                            logger.info("Dismissed dialog: %s", sel)
+                            time.sleep(1.2)
+                    except Exception:
+                        pass
+                if not dismissed_any:
+                    break  # no more dialogs to dismiss
+
+            # Take screenshot after dismissing dialogs
+            _save_debug_screenshot(page, f"after_dismiss_{username[:6]}")
+
+            # ── Try multiple selectors for the username input ───────────────
+            USERNAME_SELECTORS = [
+                "input[name='username']",
+                "input[aria-label='Phone number, username, or email']",
+                "input[autocomplete='username']",
+                "input[type='text']",   # broad fallback
+            ]
+
+            user_input = None
+            for sel in USERNAME_SELECTORS:
+                try:
+                    loc = page.locator(sel).first
+                    loc.wait_for(state="visible", timeout=6_000)
+                    user_input = loc
+                    logger.info("Found username input with selector: %s", sel)
+                    break
+                except Exception:
+                    logger.debug("Username selector not found: %s", sel)
+
+            if user_input is None:
+                _save_debug_screenshot(page, f"no_input_{username[:6]}")
+                return {
+                    "status": "failed",
+                    "error": (
+                        "Could not find the Instagram login form. "
+                        f"Current page: {page.url}. "
+                        "Instagram may be showing a CAPTCHA or blocking the server IP. "
+                        "Check the debug screenshot in Render logs."
+                    ),
+                }
+
             user_input.fill("")
             user_input.type(username, delay=80)
             time.sleep(0.5)
