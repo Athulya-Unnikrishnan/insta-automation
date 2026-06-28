@@ -177,81 +177,194 @@ def login(username: str, password: str) -> dict:
             logger.info("Navigating to Instagram login page for %s", username)
             page.goto(
                 "https://www.instagram.com/accounts/login/",
-                wait_until="networkidle",   # wait for all requests to settle
+                wait_until="domcontentloaded",
                 timeout=45_000,
             )
 
-            # Take a screenshot IMMEDIATELY so we can see what Instagram showed
-            _save_debug_screenshot(page, f"login_page_{username[:6]}")
-            logger.info("Login page loaded. URL: %s", page.url)
+            # Wait for React to hydrate
+            time.sleep(4)
 
-            # Give the page a moment to render any overlays
-            time.sleep(3)
+            # ── Log page state so we can diagnose in Render logs ──────────
+            try:
+                page_state = page.evaluate("""() => ({
+                    title:   document.title,
+                    url:     window.location.href,
+                    inputs:  [...document.querySelectorAll('input')].map(i => ({
+                        name: i.name, type: i.type, placeholder: i.placeholder,
+                        visible: i.offsetHeight > 0 && i.offsetWidth > 0,
+                        disabled: i.disabled
+                    })),
+                    buttons: [...document.querySelectorAll('button,[role=button]')]
+                                .slice(0, 20)
+                                .map(b => b.textContent?.trim()?.substring(0, 80))
+                                .filter(Boolean)
+                })""")
+                logger.info("Page state: title=%r inputs=%d buttons=%s",
+                            page_state.get("title"),
+                            len(page_state.get("inputs", [])),
+                            page_state.get("buttons"))
+            except Exception as e:
+                logger.warning("Could not evaluate page state: %s", e)
 
-            # ── Dismiss ANY pre-login dialogs (cookie walls, interstitials) ─
-            # Try each selector and dismiss up to 3 rounds of dialogs
-            for _round in range(3):
-                dismissed_any = False
-                for sel in DISMISS_SELECTORS:
-                    try:
-                        btn = page.locator(sel).first
-                        if btn.is_visible(timeout=1_500):
-                            btn.click()
-                            dismissed_any = True
-                            logger.info("Dismissed dialog: %s", sel)
-                            time.sleep(1.2)
-                    except Exception:
-                        pass
-                if not dismissed_any:
-                    break  # no more dialogs to dismiss
+            # Take screenshot immediately after load
+            _save_debug_screenshot(page, f"login_load_{username[:6]}")
 
-            # Take screenshot after dismissing dialogs
-            _save_debug_screenshot(page, f"after_dismiss_{username[:6]}")
-
-            # ── Try multiple selectors for the username input ───────────────
-            USERNAME_SELECTORS = [
-                "input[name='username']",
-                "input[aria-label='Phone number, username, or email']",
-                "input[autocomplete='username']",
-                "input[type='text']",   # broad fallback
+            # ── JS-based cookie / consent dialog dismissal ────────────────
+            # Uses JavaScript directly (bypasses Playwright selector issues with React)
+            CONSENT_KEYWORDS = [
+                "allow all cookies",
+                "accept all cookies",
+                "allow essential and optional cookies",
+                "allow all",
+                "accept all",
+                "allow cookies",
+                "accept cookies",
+                "decline optional",   # ← also acceptable (removes the consent wall)
             ]
 
-            user_input = None
-            for sel in USERNAME_SELECTORS:
-                try:
-                    loc = page.locator(sel).first
-                    loc.wait_for(state="visible", timeout=6_000)
-                    user_input = loc
-                    logger.info("Found username input with selector: %s", sel)
+            for _attempt in range(4):
+                dismissed = page.evaluate(
+                    """(keywords) => {
+                        const all = [...document.querySelectorAll(
+                            'button, [role="button"], a[role="button"]'
+                        )];
+                        for (const kw of keywords) {
+                            for (const btn of all) {
+                                const t = (btn.textContent || '').trim().toLowerCase();
+                                if (t.includes(kw)) {
+                                    btn.click();
+                                    return 'clicked: ' + btn.textContent.trim();
+                                }
+                            }
+                        }
+                        return null;
+                    }""",
+                    CONSENT_KEYWORDS,
+                )
+                if dismissed:
+                    logger.info("JS consent dismissal attempt %d: %s", _attempt + 1, dismissed)
+                    time.sleep(2)
+                else:
                     break
-                except Exception:
-                    logger.debug("Username selector not found: %s", sel)
 
-            if user_input is None:
-                _save_debug_screenshot(page, f"no_input_{username[:6]}")
+            # Take screenshot after consent dismissal
+            _save_debug_screenshot(page, f"after_consent_{username[:6]}")
+
+            # ── Wait for login form inputs using JS polling ───────────────
+            # Uses JavaScript so it works even if React hasn't fully re-rendered
+            logger.info("Waiting for login form to appear…")
+            for _wait_attempt in range(12):   # up to 24 seconds
+                time.sleep(2)
+                inputs_info = page.evaluate("""() => {
+                    const inputs = [...document.querySelectorAll('input')];
+                    return inputs.map(i => ({
+                        name:     i.name,
+                        type:     i.type,
+                        placeholder: i.placeholder,
+                        visible:  i.offsetHeight > 0 && i.offsetWidth > 0,
+                        disabled: i.disabled
+                    }));
+                }""")
+                usernames = [i for i in inputs_info
+                             if i.get("name") == "username"
+                             or i.get("placeholder", "").lower() in ("username", "phone number, username, or email")
+                             or i.get("type") == "text" and i.get("visible")]
+                if usernames:
+                    logger.info("Login form appeared after %d polls. Inputs: %s",
+                                _wait_attempt + 1, inputs_info)
+                    break
+                logger.debug("Poll %d: no username input yet. All inputs: %s",
+                             _wait_attempt + 1, inputs_info)
+            else:
+                # Log final page state for diagnosis
+                final_state = page.evaluate("""() => ({
+                    url:     window.location.href,
+                    title:   document.title,
+                    inputs:  [...document.querySelectorAll('input')].map(i => ({
+                        name: i.name, type: i.type, visible: i.offsetHeight > 0
+                    })),
+                    buttons: [...document.querySelectorAll('button')].slice(0, 10)
+                                .map(b => b.textContent?.trim()?.substring(0, 60))
+                })""")
+                logger.error("Login form never appeared. Final state: %s", final_state)
+                _save_debug_screenshot(page, f"no_form_{username[:6]}")
                 return {
                     "status": "failed",
                     "error": (
-                        "Could not find the Instagram login form. "
-                        f"Current page: {page.url}. "
-                        "Instagram may be showing a CAPTCHA or blocking the server IP. "
-                        "Check the debug screenshot in Render logs."
+                        f"Instagram did not show the login form after 30 seconds. "
+                        f"Page title: {final_state.get('title', 'unknown')}. "
+                        f"Buttons visible: {final_state.get('buttons', [])}. "
+                        "Visit /debug-screenshots to see what the browser saw."
                     ),
                 }
 
-            user_input.fill("")
-            user_input.type(username, delay=80)
+            # ── Fill username using JS (React-safe approach) ──────────────
+            filled_user = page.evaluate(
+                """(uname) => {
+                    // Find username input by multiple strategies
+                    let inp = document.querySelector("input[name='username']")
+                           || document.querySelector("input[autocomplete='username']")
+                           || [...document.querySelectorAll('input[type=text]')]
+                                  .find(i => i.offsetHeight > 0);
+                    if (!inp) return false;
+                    inp.focus();
+                    // React-safe: use nativeInputValueSetter to trigger React events
+                    const nativeSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    )?.set;
+                    if (nativeSetter) {
+                        nativeSetter.call(inp, uname);
+                        inp.dispatchEvent(new Event('input',  {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    } else {
+                        inp.value = uname;
+                        inp.dispatchEvent(new Event('input',  {bubbles: true}));
+                    }
+                    return true;
+                }""",
+                username,
+            )
+            if not filled_user:
+                return {"status": "failed", "error": "Could not fill username field via JavaScript."}
+            time.sleep(0.8)
+
+            # Tab to password field (more natural than clicking)
+            page.keyboard.press("Tab")
             time.sleep(0.5)
 
-            # Fill password field
-            pass_input = page.locator("input[name='password']")
-            pass_input.fill("")
-            pass_input.type(password, delay=80)
-            time.sleep(0.5)
+            # ── Fill password using JS ─────────────────────────────────────
+            filled_pass = page.evaluate(
+                """(pwd) => {
+                    let inp = document.querySelector("input[name='password']")
+                           || document.querySelector("input[type='password']");
+                    if (!inp) return false;
+                    inp.focus();
+                    const nativeSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    )?.set;
+                    if (nativeSetter) {
+                        nativeSetter.call(inp, pwd);
+                        inp.dispatchEvent(new Event('input',  {bubbles: true}));
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    } else {
+                        inp.value = pwd;
+                        inp.dispatchEvent(new Event('input',  {bubbles: true}));
+                    }
+                    return true;
+                }""",
+                password,
+            )
+            if not filled_pass:
+                return {"status": "failed", "error": "Could not fill password field via JavaScript."}
+            time.sleep(0.8)
 
-            # Click login button
-            login_btn = page.locator("button[type='submit']")
-            login_btn.click()
+            # ── Click login button via JS ──────────────────────────────────
+            page.evaluate("""() => {
+                const btn = document.querySelector("button[type='submit']")
+                         || [...document.querySelectorAll('button')]
+                               .find(b => /log.?in|sign.?in/i.test(b.textContent));
+                if (btn) btn.click();
+            }""")
             time.sleep(3)
 
             current_url = page.url
