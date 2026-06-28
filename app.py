@@ -109,6 +109,32 @@ def debug():
     return jsonify(info)
 
 
+@app.route("/ping-playwright")
+def ping_playwright():
+    """
+    Quick test: launch Chromium, open google.com, return title.
+    Use this to verify Playwright/Chromium works on Render before trying login.
+    Takes ~10 seconds.
+    """
+    if not SCRAPER_OK:
+        return jsonify({"ok": False, "error": "Scraper not initialized: " + str(_SCRAPER_ERROR)}), 500
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            page = browser.new_page()
+            page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=20_000)
+            title = page.title()
+            browser.close()
+        return jsonify({"ok": True, "page_title": title, "message": "Playwright + Chromium works correctly!"})
+    except Exception as exc:
+        logger.exception("Playwright ping failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/")
 @require_auth
 def index():

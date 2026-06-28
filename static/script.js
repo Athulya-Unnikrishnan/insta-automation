@@ -21,6 +21,7 @@ const twofaFormSection  = $('twofa-form-section');
 const loginUsername     = $('login-username');
 const loginPassword     = $('login-password');
 const loginError        = $('login-error');
+const loginStatus       = $('login-status');      // ← live progress message
 const btnLogin          = $('btn-login');
 const twofaCode         = $('twofa-code');
 const twofaError        = $('twofa-error');
@@ -124,6 +125,7 @@ async function handleLogin() {
   const password = loginPassword.value.trim();
 
   loginError.hidden = true;
+  loginStatus.hidden = true;
 
   if (!username || !password) {
     showModalError(loginError, 'Please enter your username and password.');
@@ -132,13 +134,50 @@ async function handleLogin() {
 
   setLoading(btnLogin, true);
 
+  // ── Live status messages while Playwright runs on the server ──────────────
+  // Instagram login takes 30–90 seconds headlessly on a cloud server.
+  const STAGES = [
+    { ms:     0, msg: '⏳ Sending credentials to server…' },
+    { ms:  3000, msg: '🌐 Launching headless Chromium browser…' },
+    { ms:  8000, msg: '📸 Opening Instagram login page…' },
+    { ms: 18000, msg: '🔐 Submitting your credentials…' },
+    { ms: 28000, msg: '⏳ Waiting for Instagram to respond…' },
+    { ms: 50000, msg: '🔄 Still working — Instagram can be slow from server IPs…' },
+    { ms: 80000, msg: '⏱️ Almost there, hang tight…' },
+  ];
+
+  const statusTimers = STAGES.map(({ ms, msg }) =>
+    setTimeout(() => {
+      loginStatus.textContent = msg;
+      loginStatus.hidden = false;
+    }, ms)
+  );
+
+  const clearStatusTimers = () => statusTimers.forEach(clearTimeout);
+
+  // 5-minute hard timeout
+  const controller = new AbortController();
+  const hardTimeout = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+
   try {
-    const res  = await fetch('/login', {
+    const res = await fetch('/login', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ username, password }),
+      signal:  controller.signal,
     });
-    const data = await res.json();
+
+    clearStatusTimers();
+    clearTimeout(hardTimeout);
+    loginStatus.hidden = true;
+
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      showModalError(loginError, `Server error (HTTP ${res.status}). Check the Render logs for details.`);
+      return;
+    }
 
     if (data.status === 'ok') {
       pendingPw = null;
@@ -154,14 +193,26 @@ async function handleLogin() {
     } else if (data.status === 'challenge') {
       showModalError(loginError,
         '⚠️ Instagram flagged this login as suspicious (new server IP). ' +
-        'Try logging into instagram.com in your personal browser first, then try again.'
+        'Try logging into instagram.com normally in your personal browser first ' +
+        'to clear any flags, then try again here.'
       );
 
     } else {
-      showModalError(loginError, data.error || 'Login failed. Check your credentials and try again.');
+      // Show the actual server error so we can debug
+      const errMsg = data.error || 'Login failed. Check your credentials.';
+      showModalError(loginError, '❌ ' + errMsg);
     }
+
   } catch (err) {
-    showModalError(loginError, 'Network error: ' + err.message);
+    clearStatusTimers();
+    clearTimeout(hardTimeout);
+    loginStatus.hidden = true;
+
+    if (err.name === 'AbortError') {
+      showModalError(loginError, '⏱️ Login timed out after 5 minutes. Instagram may be blocking server IPs. Try again or check Render logs.');
+    } else {
+      showModalError(loginError, '🔌 Network error: ' + err.message);
+    }
   } finally {
     setLoading(btnLogin, false);
   }

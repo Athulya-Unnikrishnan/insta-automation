@@ -214,7 +214,7 @@ body {
   font-weight: 700;
   cursor: pointer;
   margin-top: 4px;
-  position: relative;
+  position: relative;          /* ← needed so spinner positions inside button */
   overflow: hidden;
   transition: opacity var(--transition), transform var(--transition);
 }
@@ -245,6 +245,19 @@ body {
   font-size: 0.75rem;
   color: var(--text-muted);
   margin-top: 16px;
+  line-height: 1.5;
+}
+
+.login-status {
+  text-align: center;
+  font-size: 0.82rem;
+  color: #c4b5fd;
+  margin-top: 14px;
+  padding: 10px 14px;
+  background: rgba(176,75,254,0.08);
+  border: 1px solid rgba(176,75,254,0.2);
+  border-radius: var(--radius-sm);
+  animation: fade-in 0.3s ease;
   line-height: 1.5;
 }
 
