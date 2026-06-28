@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: insta-giveaway-picker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter           # Starter ($7/mo) recommended — free tier may OOM with Playwright
+    healthCheckPath: /health
+    envVars:
+      - key: APP_PASSWORD
+        sync: false         # Set this in the Render dashboard — leave blank for no password
+      - key: SESSION_DIR
+        value: /data/sessions
+      - key: DEBUG_DIR
+        value: /data/debug
+      - key: PORT
+        value: 10000
+    disk:
+      name: sessions-disk
+      mountPath: /data
+      sizeGB: 1             # $1/mo — stores per-user Instagram sessions

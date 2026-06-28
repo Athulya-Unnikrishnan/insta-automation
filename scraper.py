@@ -1,0 +1,415 @@
+"""
+scraper.py — Playwright Instagram comment scraper (headless / server mode).
+
+Supports:
+  - Headless Chromium (no display required — works on Render / Docker)
+  - Per-user session files keyed by SHA-256 of the username
+  - Credential-based login (username + password filled programmatically)
+  - 2FA detection — returns a structured status so the caller can handle it
+  - Debug screenshot saving on errors
+"""
+
+import hashlib
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Optional
+
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+logger = logging.getLogger(__name__)
+
+# ── Directories (read from env so they work both locally and on Render) ────
+SESSION_DIR = Path(os.environ.get("SESSION_DIR", "./sessions"))
+DEBUG_DIR   = Path(os.environ.get("DEBUG_DIR",   "./debug"))
+
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
+DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Selectors ──────────────────────────────────────────────────────────────
+LOAD_MORE_SELECTORS = [
+    "svg[aria-label='Load more comments']",
+    "[aria-label='Load more comments']",
+    "button:has-text('Load more comments')",
+    "span:has-text('Load more comments')",
+    "button[class*='_abl-']",
+    "span[class*='_abl-']",
+]
+
+DISMISS_SELECTORS = [
+    "button:has-text('Allow all cookies')",
+    "button:has-text('Accept All')",
+    "button:has-text('Not Now')",
+    "[aria-label='Close']",
+]
+
+
+# ── Session helpers ────────────────────────────────────────────────────────
+
+def _session_path(username: str) -> Path:
+    """Return the session file path for a given username (hashed for safety)."""
+    h = hashlib.sha256(username.lower().strip().encode()).hexdigest()[:16]
+    return SESSION_DIR / f"{h}.json"
+
+
+def has_session(username: str) -> bool:
+    p = _session_path(username)
+    return p.exists() and p.stat().st_size > 10
+
+
+def delete_session(username: str) -> bool:
+    p = _session_path(username)
+    if p.exists():
+        p.unlink()
+        logger.info("Deleted session for %s", username)
+        return True
+    return False
+
+
+def _save_session(context, username: str) -> None:
+    state = context.storage_state()
+    path  = _session_path(username)
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    logger.info("Session saved for %s → %s", username, path)
+
+
+def _save_debug_screenshot(page, label: str) -> Optional[str]:
+    try:
+        path = DEBUG_DIR / f"{label}_{int(time.time())}.png"
+        page.screenshot(path=str(path))
+        logger.info("Debug screenshot saved: %s", path)
+        return str(path)
+    except Exception:
+        return None
+
+
+# ── Browser factory ────────────────────────────────────────────────────────
+
+def _make_browser_context(p, username: str):
+    """Launch headless Chromium + create a context (with session if available)."""
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1280,900",
+        ],
+    )
+
+    context_kwargs = {
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "viewport":       {"width": 1280, "height": 900},
+        "locale":         "en-US",
+        "timezone_id":    "America/New_York",
+        "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+    }
+
+    if has_session(username):
+        logger.info("Loading saved session for %s", username)
+        context_kwargs["storage_state"] = str(_session_path(username))
+
+    context = browser.new_context(**context_kwargs)
+    # Hide webdriver fingerprint
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    return browser, context
+
+
+# ── Login ──────────────────────────────────────────────────────────────────
+
+def login(username: str, password: str) -> dict:
+    """
+    Log into Instagram with the given credentials using headless Playwright.
+
+    Returns a dict:
+      { "status": "ok" }
+      { "status": "2fa_required" }
+      { "status": "challenge" }
+      { "status": "failed", "error": str }
+    """
+    logger.info("Starting login for %s", username)
+
+    with sync_playwright() as p:
+        browser, context = _make_browser_context(p, username)
+        page = context.new_page()
+
+        try:
+            page.goto(
+                "https://www.instagram.com/accounts/login/",
+                wait_until="domcontentloaded",
+                timeout=30_000,
+            )
+            time.sleep(2)
+
+            # Dismiss cookie banner if present
+            _dismiss_dialogs(page)
+
+            # Fill username field
+            user_input = page.locator("input[name='username']")
+            user_input.wait_for(timeout=10_000)
+            user_input.fill("")
+            user_input.type(username, delay=80)
+            time.sleep(0.5)
+
+            # Fill password field
+            pass_input = page.locator("input[name='password']")
+            pass_input.fill("")
+            pass_input.type(password, delay=80)
+            time.sleep(0.5)
+
+            # Click login button
+            login_btn = page.locator("button[type='submit']")
+            login_btn.click()
+            time.sleep(3)
+
+            current_url = page.url
+
+            # ── 2FA required ───────────────────────────────────────────────
+            if "two_factor" in current_url or page.locator("input[name='verificationCode']").is_visible(timeout=3_000):
+                logger.warning("2FA required for %s", username)
+                _save_debug_screenshot(page, f"2fa_{username[:6]}")
+                return {"status": "2fa_required"}
+
+            # ── Security challenge (e.g. suspicious login) ─────────────────
+            if "challenge" in current_url:
+                logger.warning("Challenge detected for %s", username)
+                _save_debug_screenshot(page, f"challenge_{username[:6]}")
+                return {"status": "challenge"}
+
+            # ── Wrong password / error message ─────────────────────────────
+            error_locator = page.locator("#slfErrorAlert, [role='alert']")
+            if error_locator.is_visible(timeout=3_000):
+                error_msg = error_locator.inner_text()
+                logger.error("Login error for %s: %s", username, error_msg)
+                _save_debug_screenshot(page, f"error_{username[:6]}")
+                return {"status": "failed", "error": error_msg}
+
+            # ── Wait for home feed (successful login) ──────────────────────
+            try:
+                page.wait_for_url(
+                    lambda url: (
+                        "accounts/login" not in url
+                        and "challenge" not in url
+                        and "two_factor" not in url
+                    ),
+                    timeout=20_000,
+                )
+            except PlaywrightTimeout:
+                _save_debug_screenshot(page, f"timeout_{username[:6]}")
+                return {"status": "failed", "error": "Login timed out — Instagram may be challenging this login."}
+
+            time.sleep(2)
+            _save_session(context, username)
+            logger.info("Login successful for %s", username)
+            return {"status": "ok"}
+
+        except Exception as exc:
+            logger.exception("Login exception for %s", username)
+            _save_debug_screenshot(page, f"exception_{username[:6]}")
+            return {"status": "failed", "error": str(exc)}
+        finally:
+            browser.close()
+
+
+def submit_2fa(username: str, password: str, code: str) -> dict:
+    """
+    Complete login when 2FA is required.
+    Re-logs in and then submits the verification code.
+    """
+    logger.info("Submitting 2FA code for %s", username)
+
+    with sync_playwright() as p:
+        browser, context = _make_browser_context(p, username)
+        page = context.new_page()
+
+        try:
+            page.goto("https://www.instagram.com/accounts/login/", wait_until="domcontentloaded", timeout=30_000)
+            time.sleep(2)
+            _dismiss_dialogs(page)
+
+            page.locator("input[name='username']").fill(username)
+            page.locator("input[name='password']").fill(password)
+            page.locator("button[type='submit']").click()
+            time.sleep(3)
+
+            code_input = page.locator("input[name='verificationCode']")
+            code_input.wait_for(timeout=10_000)
+            code_input.fill(code.strip())
+
+            confirm_btn = page.locator("button[type='button']:has-text('Confirm'), button[type='submit']")
+            confirm_btn.first.click()
+            time.sleep(3)
+
+            page.wait_for_url(
+                lambda url: "accounts/login" not in url and "two_factor" not in url,
+                timeout=15_000,
+            )
+            time.sleep(2)
+            _save_session(context, username)
+            return {"status": "ok"}
+
+        except Exception as exc:
+            logger.exception("2FA exception for %s", username)
+            return {"status": "failed", "error": str(exc)}
+        finally:
+            browser.close()
+
+
+# ── Comment scraping ───────────────────────────────────────────────────────
+
+def fetch_comments(post_url: str, username: str) -> list[dict]:
+    """
+    Navigate to a post and extract all comments.
+
+    Args:
+        post_url: Full Instagram post/reel URL.
+        username: The logged-in user's Instagram username (to load their session).
+
+    Returns:
+        List of {"username": str, "text": str} dicts.
+
+    Raises:
+        RuntimeError: If no session exists for this user.
+        Exception: On any Playwright error.
+    """
+    if not has_session(username):
+        raise RuntimeError(f"No saved session for '{username}'. Please log in first.")
+
+    logger.info("Fetching comments for %s as %s", post_url, username)
+
+    with sync_playwright() as p:
+        browser, context = _make_browser_context(p, username)
+        page = context.new_page()
+
+        try:
+            page.goto(post_url, wait_until="domcontentloaded", timeout=60_000)
+            time.sleep(3)
+
+            # Dismiss any pop-ups
+            _dismiss_dialogs(page)
+
+            # Check if we got redirected to login (session expired)
+            if "accounts/login" in page.url:
+                delete_session(username)
+                raise RuntimeError("Session expired. Please log in again.")
+
+            # Load all comments
+            _load_all_comments(page)
+
+            # Extract
+            comments = _extract_comments(page)
+
+            # Re-save session (cookies may have refreshed)
+            _save_session(context, username)
+
+            return comments
+
+        except Exception:
+            _save_debug_screenshot(page, f"scrape_error_{username[:6]}")
+            raise
+        finally:
+            browser.close()
+
+
+def _dismiss_dialogs(page) -> None:
+    for sel in DISMISS_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=1_500):
+                btn.click()
+                time.sleep(0.8)
+        except Exception:
+            pass
+
+
+def _load_all_comments(page) -> None:
+    max_clicks = 200
+    clicked    = 0
+
+    for _ in range(max_clicks):
+        button = None
+        for sel in LOAD_MORE_SELECTORS:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=2_000):
+                    button = btn
+                    break
+            except Exception:
+                continue
+
+        if button is None:
+            logger.info("No more 'Load more comments' button — done after %d clicks.", clicked)
+            break
+
+        try:
+            button.scroll_into_view_if_needed()
+            button.click()
+            clicked += 1
+            logger.debug("Load-more click #%d", clicked)
+            time.sleep(1.8 + (clicked % 3) * 0.4)
+        except Exception as exc:
+            logger.warning("Load-more click failed: %s", exc)
+            break
+
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(2)
+
+
+def _extract_comments(page) -> list[dict]:
+    raw = page.evaluate(
+        """
+        () => {
+            const comments = [];
+            const containers = document.querySelectorAll('ul li, article ul li');
+
+            containers.forEach(li => {
+                const links = li.querySelectorAll('a');
+                let username = '';
+                for (const a of links) {
+                    const text = (a.textContent || '').trim();
+                    if (text && !text.startsWith('#') && text.length < 50) {
+                        username = text;
+                        break;
+                    }
+                }
+                if (!username) return;
+
+                const spans = li.querySelectorAll('span');
+                let commentText = '';
+                for (const span of spans) {
+                    const t = (span.textContent || '').trim();
+                    if (t && t !== username && !t.match(/^\\d+[smhd]$/) && t.length > 0) {
+                        commentText = t;
+                        break;
+                    }
+                }
+
+                if (username && commentText) {
+                    comments.push({ username, text: commentText });
+                }
+            });
+
+            return comments;
+        }
+        """
+    )
+
+    seen    = set()
+    results = []
+    for item in raw:
+        key = (item.get("username", "").strip(), item.get("text", "").strip()[:120])
+        if key not in seen and key[0] and key[1]:
+            seen.add(key)
+            results.append({"username": key[0], "text": key[1]})
+
+    logger.info("Extracted %d unique comments.", len(results))
+    return results

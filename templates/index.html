@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Instagram Giveaway Picker</title>
+  <meta name="description" content="Pick a random winner from Instagram post comments using browser automation. Personal tool — no API key required." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- Background orbs -->
+  <div class="bg-orb bg-orb-1" aria-hidden="true"></div>
+  <div class="bg-orb bg-orb-2" aria-hidden="true"></div>
+  <div class="bg-orb bg-orb-3" aria-hidden="true"></div>
+
+  <!-- Confetti canvas -->
+  <canvas id="confetti-canvas" aria-hidden="true"></canvas>
+
+  <!-- ═══════════════════════════════════════════════════════
+       LOGIN MODAL — shown when no active session
+  ═══════════════════════════════════════════════════════ -->
+  <div id="login-overlay" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+    <div class="modal-card">
+      <div class="modal-logo">
+        <svg width="36" height="36" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="ig-grad-modal" x1="0%" y1="100%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#fcb045"/>
+              <stop offset="50%" stop-color="#fd1d1d"/>
+              <stop offset="100%" stop-color="#833ab4"/>
+            </linearGradient>
+          </defs>
+          <rect x="2" y="2" width="28" height="28" rx="8" stroke="url(#ig-grad-modal)" stroke-width="2.5"/>
+          <circle cx="16" cy="16" r="5.5" stroke="url(#ig-grad-modal)" stroke-width="2.5"/>
+          <circle cx="23.5" cy="8.5" r="1.5" fill="url(#ig-grad-modal)"/>
+        </svg>
+      </div>
+
+      <!-- Standard login form -->
+      <div id="login-form-section">
+        <h1 class="modal-title" id="modal-title">Connect Instagram</h1>
+        <p class="modal-subtitle">Your credentials are used only to log in. Only the session cookie is stored — your password is never saved.</p>
+
+        <div class="modal-field">
+          <label class="field-label" for="login-username">Instagram Username</label>
+          <input type="text" id="login-username" class="field-input" placeholder="your_username" autocomplete="username" spellcheck="false" />
+        </div>
+
+        <div class="modal-field">
+          <label class="field-label" for="login-password">Password</label>
+          <div class="password-wrap">
+            <input type="password" id="login-password" class="field-input" placeholder="••••••••" autocomplete="current-password" />
+            <button class="btn-toggle-pw" id="btn-toggle-pw" type="button" aria-label="Toggle password visibility" tabindex="-1">
+              <svg id="pw-eye-open" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              <svg id="pw-eye-closed" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div id="login-error" class="modal-error" hidden></div>
+
+        <button class="btn-connect" id="btn-login" type="button">
+          <span class="btn-text">Connect Instagram</span>
+          <span class="btn-spinner" aria-hidden="true"></span>
+        </button>
+
+        <p class="modal-notice">
+          🔒 Sent over HTTPS · Session stored on server · Password never saved
+        </p>
+      </div>
+
+      <!-- 2FA form (shown when Instagram requires a code) -->
+      <div id="twofa-form-section" hidden>
+        <h2 class="modal-title">Two-Factor Auth</h2>
+        <p class="modal-subtitle">Instagram sent a verification code to your phone or email. Enter it below.</p>
+
+        <div class="modal-field">
+          <label class="field-label" for="twofa-code">Verification Code</label>
+          <input type="text" id="twofa-code" class="field-input field-input--center" placeholder="000000" maxlength="8" inputmode="numeric" autocomplete="one-time-code" />
+        </div>
+
+        <div id="twofa-error" class="modal-error" hidden></div>
+
+        <button class="btn-connect" id="btn-twofa" type="button">
+          <span class="btn-text">Verify</span>
+          <span class="btn-spinner" aria-hidden="true"></span>
+        </button>
+
+        <button class="btn-back" id="btn-back-login" type="button">← Back to login</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════
+       HEADER
+  ═══════════════════════════════════════════════════════ -->
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-icon" aria-hidden="true">
+          <svg width="28" height="28" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="ig-grad-hdr" x1="0%" y1="100%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="#fcb045"/>
+                <stop offset="50%" stop-color="#fd1d1d"/>
+                <stop offset="100%" stop-color="#833ab4"/>
+              </linearGradient>
+            </defs>
+            <rect x="2" y="2" width="28" height="28" rx="8" stroke="url(#ig-grad-hdr)" stroke-width="2.5"/>
+            <circle cx="16" cy="16" r="5.5" stroke="url(#ig-grad-hdr)" stroke-width="2.5"/>
+            <circle cx="23.5" cy="8.5" r="1.5" fill="url(#ig-grad-hdr)"/>
+          </svg>
+        </span>
+        <span class="logo-text">Giveaway Picker</span>
+      </div>
+
+      <div class="user-pill" id="user-pill">
+        <span class="user-dot" id="user-dot"></span>
+        <span class="user-name" id="user-name">Not logged in</span>
+        <button class="btn-ghost btn-sm" id="btn-logout" hidden>Logout</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════
+       MAIN
+  ═══════════════════════════════════════════════════════ -->
+  <main class="main-content">
+
+    <!-- Step 1 — URL Input -->
+    <section class="card step-card" id="step-url">
+      <div class="step-label">Step 1</div>
+      <h2 class="card-title">Paste Instagram Post URL</h2>
+      <p class="card-subtitle">Works with posts and reels. The account must be accessible by your logged-in Instagram account.</p>
+
+      <div class="input-group">
+        <span class="input-icon" aria-hidden="true">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+        </span>
+        <input type="url" id="post-url" class="url-input" placeholder="https://www.instagram.com/p/Cxxxxxxxx/" autocomplete="off" spellcheck="false" aria-label="Instagram post URL" />
+        <button class="btn-primary" id="btn-load" aria-label="Load comments">
+          <span class="btn-text">Load Comments</span>
+          <span class="btn-spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+
+      <div id="error-banner" class="error-banner" role="alert" aria-live="polite" hidden>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <span id="error-text"></span>
+      </div>
+
+      <div id="info-banner" class="info-banner" hidden>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 8 12 12 16 14"/></svg>
+        <span id="info-text">Launching browser…</span>
+      </div>
+    </section>
+
+    <!-- Step 2 — Comments -->
+    <section class="card step-card" id="step-comments" hidden>
+      <div class="step-label">Step 2</div>
+      <div class="comments-header">
+        <div>
+          <h2 class="card-title">Comments Loaded</h2>
+          <p class="card-subtitle">
+            <span id="comment-count">0</span> comments ·
+            <span id="unique-count">0</span> unique users
+          </p>
+        </div>
+        <div class="filter-group">
+          <label class="filter-label" for="filter-input">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+            Keyword filter
+          </label>
+          <input type="text" id="filter-input" class="filter-input" placeholder="e.g. @ or tag" aria-label="Optional keyword filter" />
+          <label class="checkbox-label">
+            <input type="checkbox" id="dedup-check" checked />
+            <span class="checkbox-custom"></span>
+            One entry per user
+          </label>
+        </div>
+      </div>
+
+      <div class="comments-scroll" id="comments-list" role="list" aria-label="Comment list"></div>
+
+      <button class="btn-winner" id="btn-pick" aria-label="Pick a random winner">
+        <span class="trophy-icon" aria-hidden="true">🏆</span>
+        Pick Winner!
+      </button>
+    </section>
+
+    <!-- Step 3 — Winner -->
+    <section class="card step-card winner-card" id="step-winner" hidden aria-live="polite">
+      <div class="winner-glow" aria-hidden="true"></div>
+      <div class="step-label">🎉 Winner</div>
+
+      <div class="winner-avatar" id="winner-avatar" aria-hidden="true">
+        <span id="winner-initial"></span>
+      </div>
+
+      <h2 class="winner-name" id="winner-username">@username</h2>
+      <p class="winner-comment" id="winner-comment">"comment"</p>
+      <p class="winner-meta" id="winner-pool-size"></p>
+
+      <div class="winner-actions">
+        <button class="btn-primary" id="btn-pick-again">🎲 Pick Again</button>
+        <button class="btn-ghost" id="btn-copy-winner">📋 Copy Username</button>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    <p>Personal use only · Browser automation via Playwright · No data leaves the server</p>
+  </footer>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
