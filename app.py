@@ -19,9 +19,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, Response
+from whitenoise import WhiteNoise
 
 from picker import pick_winner
-from scraper import delete_session, fetch_comments, has_session, login, submit_2fa
 
 # ── Load .env for local development ────────────────────────────────────────
 load_dotenv()
@@ -32,7 +32,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+# ── Import scraper safely — a bad SESSION_DIR must not kill the whole app ──
+_SCRAPER_ERROR = None
+try:
+    from scraper import delete_session, fetch_comments, has_session, login, submit_2fa
+    SCRAPER_OK = True
+except Exception as _scraper_err:
+    _SCRAPER_ERROR = str(_scraper_err)
+    logger.error("Failed to import scraper: %s", _scraper_err)
+    SCRAPER_OK = False
+
+# ── Flask app — explicit paths so gunicorn always finds static/templates ───
+_HERE = Path(__file__).parent
+app = Flask(
+    __name__,
+    static_folder=str(_HERE / "static"),
+    template_folder=str(_HERE / "templates"),
+)
+
+# ── WhiteNoise: serve static files reliably under gunicorn ─────────────────
+# This wraps the WSGI app so static files are served directly without
+# going through Flask's routing — faster and more reliable on Render.
+app.wsgi_app = WhiteNoise(
+    app.wsgi_app,
+    root=str(_HERE / "static"),
+    prefix="static",
+)
 
 # ── Optional HTTP Basic Auth ────────────────────────────────────────────────
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "").strip()
@@ -61,7 +86,27 @@ def require_auth(f):
 @app.route("/health")
 def health():
     """Render health check endpoint."""
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "scraper_ok": SCRAPER_OK})
+
+
+@app.route("/debug")
+def debug():
+    """Startup diagnostics — visit /debug to see what's working."""
+    import sys
+    info: dict = {
+        "scraper_ok":    SCRAPER_OK,
+        "scraper_error": _SCRAPER_ERROR,
+        "static_folder": str(app.static_folder),
+        "template_folder": str(app.template_folder),
+        "python":        sys.version,
+        "cwd":           os.getcwd(),
+    }
+    if SCRAPER_OK:
+        from scraper import SESSION_DIR, DEBUG_DIR
+        info["session_dir"]        = str(SESSION_DIR)
+        info["session_dir_exists"] = SESSION_DIR.exists()
+        info["debug_dir"]          = str(DEBUG_DIR)
+    return jsonify(info)
 
 
 @app.route("/")
@@ -73,6 +118,8 @@ def index():
 @app.route("/session-status")
 @require_auth
 def session_status():
+    if not SCRAPER_OK:
+        return jsonify({"has_session": False, "error": "Scraper not initialized"})
     username = (request.args.get("username") or "").strip()
     if not username:
         return jsonify({"has_session": False})
@@ -82,14 +129,8 @@ def session_status():
 @app.route("/login", methods=["POST"])
 @require_auth
 def login_route():
-    """
-    Body: { "username": str, "password": str }
-    Returns:
-      { "status": "ok" }
-      { "status": "2fa_required" }
-      { "status": "challenge" }
-      { "status": "failed", "error": str }
-    """
+    if not SCRAPER_OK:
+        return jsonify({"status": "failed", "error": "Scraper failed to initialize. Check /debug for details."}), 500
     data     = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = (data.get("password") or "").strip()

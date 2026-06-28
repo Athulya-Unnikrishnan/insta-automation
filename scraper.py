@@ -22,11 +22,32 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 logger = logging.getLogger(__name__)
 
 # ── Directories (read from env so they work both locally and on Render) ────
-SESSION_DIR = Path(os.environ.get("SESSION_DIR", "./sessions"))
-DEBUG_DIR   = Path(os.environ.get("DEBUG_DIR",   "./debug"))
+def _init_dirs() -> tuple[Path, Path]:
+    """
+    Initialise session and debug directories.
+    Falls back to local ./sessions and ./debug if the configured path
+    (e.g. /data/sessions) is not writable — common on Render when the
+    persistent disk hasn't been attached yet.
+    """
+    _base   = Path(__file__).parent
+    targets = [
+        (
+            Path(os.environ.get("SESSION_DIR", str(_base / "sessions"))),
+            Path(os.environ.get("DEBUG_DIR",   str(_base / "debug"))),
+        ),
+        # Hard fallback — always inside the container/workspace
+        (_base / "sessions", _base / "debug"),
+    ]
+    for sess_dir, dbg_dir in targets:
+        try:
+            sess_dir.mkdir(parents=True, exist_ok=True)
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            return sess_dir, dbg_dir
+        except OSError as exc:
+            logger.warning("Cannot create dirs %s / %s: %s — trying fallback.", sess_dir, dbg_dir, exc)
+    raise RuntimeError("Could not create any session/debug directory.")
 
-SESSION_DIR.mkdir(parents=True, exist_ok=True)
-DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+SESSION_DIR, DEBUG_DIR = _init_dirs()
 
 # ── Selectors ──────────────────────────────────────────────────────────────
 LOAD_MORE_SELECTORS = [
