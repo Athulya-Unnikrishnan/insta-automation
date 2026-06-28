@@ -175,7 +175,7 @@ def login(username: str, password: str) -> dict:
 
         try:
             logger.info("Navigating to Instagram login page for %s", username)
-            page.goto(
+            response = page.goto(
                 "https://www.instagram.com/accounts/login/",
                 wait_until="domcontentloaded",
                 timeout=45_000,
@@ -189,11 +189,13 @@ def login(username: str, password: str) -> dict:
                 page_state = page.evaluate("""() => ({
                     title:   document.title,
                     url:     window.location.href,
+                    html:    document.body ? document.body.innerHTML.substring(0, 500) : 'NO BODY',
                     inputs:  [...document.querySelectorAll('input')].map(i => ({
                         name: i.name, type: i.type, placeholder: i.placeholder,
                         visible: i.offsetHeight > 0 && i.offsetWidth > 0,
                         disabled: i.disabled
                     })),
+
                     buttons: [...document.querySelectorAll('button,[role=button]')]
                                 .slice(0, 20)
                                 .map(b => b.textContent?.trim()?.substring(0, 80))
@@ -288,13 +290,16 @@ def login(username: str, password: str) -> dict:
                 })""")
                 logger.error("Login form never appeared. Final state: %s", final_state)
                 _save_debug_screenshot(page, f"no_form_{username[:6]}")
+                status_code = response.status if response else "Unknown"
                 return {
                     "status": "failed",
                     "error": (
                         f"Instagram did not show the login form after 30 seconds. "
+                        f"HTTP Status: {status_code}. "
                         f"Page title: {final_state.get('title', 'unknown')}. "
                         f"Buttons visible: {final_state.get('buttons', [])}. "
-                        "Visit /debug-screenshots to see what the browser saw."
+                        "Visit /debug-screenshots to see what the browser saw. "
+                        "(If HTTP status is 4xx, Instagram is likely blocking this server's IP)."
                     ),
                 }
 
